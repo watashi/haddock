@@ -17,7 +17,10 @@
 -- which creates a Haddock 'Interface' from the typechecking
 -- results 'TypecheckedModule' from GHC.
 -----------------------------------------------------------------------------
-module Haddock.Interface.Create (createInterface) where
+module Haddock.Interface.Create
+  ( createInterface
+  , createInterfaceInternal
+  ) where
 
 import Documentation.Haddock.Doc (metaDocAppend)
 import Documentation.Haddock.Utf8 as Utf8
@@ -57,6 +60,7 @@ import NameEnv
 import Packages   ( lookupModuleInAllPackages, PackageName(..) )
 import Bag
 import RdrName
+import TcRnMonad (fixSafeInstances)
 import TcRnTypes
 import FastString ( unpackFS, fastStringToByteString)
 import BasicTypes ( StringLiteral(..), SourceText(..), PromotionFlag(..) )
@@ -71,26 +75,45 @@ createInterface :: TypecheckedModule
                 -> IfaceMap     -- Locally processed modules
                 -> InstIfaceMap -- External, already installed interfaces
                 -> ErrMsgGhc Interface
-createInterface tm flags modMap instIfaceMap = do
+createInterface tm flags ifaceMap instIfaceMap = do
+  createInterfaceInternal flags ifaceMap instIfaceMap
+    (pm_mod_summary $ tm_parsed_module tm)
+    (parsedSource tm)
+    (renamedSource tm)
+    (fst $ tm_internals_ tm)
+    (snd $ tm_internals_ tm)
+    (modInfoSafe $ moduleInfo tm)
 
-  let ms             = pm_mod_summary . tm_parsed_module $ tm
-      mi             = moduleInfo tm
-      L _ hsm        = parsedSource tm
-      !safety        = modInfoSafe mi
+
+createInterfaceInternal :: [Flag]
+                        -> IfaceMap
+                        -> InstIfaceMap
+                        -> ModSummary
+                        -> ParsedSource
+                        -> Maybe RenamedSource
+                        -> TcGblEnv
+                        -> ModDetails
+                        -> SafeHaskellMode
+                        -> ErrMsgGhc Interface
+createInterfaceInternal flags modMap instIfaceMap
+    ms parsed renamed tcg details safety = do
+
+  let L _ hsm        = parsed
       mdl            = ms_mod ms
-      sem_mdl        = tcg_semantic_mod (fst (tm_internals_ tm))
       is_sig         = ms_hsc_src ms == HsigFile
       dflags         = ms_hspp_opts ms
-      !instances     = modInfoInstances mi
-      !fam_instances = md_fam_insts md
-      !exportedNames = modInfoExportsWithSelectors mi
+      !instances     = fixSafeInstances safety $ md_insts details
+      !fam_instances = md_fam_insts details
+      !exportedNames = concatMap availNamesWithSelectors $! md_exports details
       (pkgNameFS, _) = modulePackageInfo dflags flags (Just mdl)
       pkgName        = fmap (unpackFS . (\(PackageName n) -> n)) pkgNameFS
 
-      (TcGblEnv { tcg_rdr_env = gre
-                , tcg_warns   = warnings
-                , tcg_exports = all_exports
-                }, md) = tm_internals_ tm
+      TcGblEnv
+        { tcg_rdr_env       = gre
+        , tcg_warns         = warnings
+        , tcg_exports       = all_exports
+        , tcg_semantic_mod  = sem_mdl
+        } = tcg
 
   -- The 'pkgName' is necessary to decide what package to mention in "@since"
   -- annotations. Not having it is not fatal though.
@@ -103,7 +126,7 @@ createInterface tm flags modMap instIfaceMap = do
   -- The renamed source should always be available to us, but it's best
   -- to be on the safe side.
   (group_, imports, mayExports, mayDocHeader) <-
-    case renamedSource tm of
+    case renamed of
       Nothing -> do
         liftErrMsg $ tell [ "Warning: Renamed source is not available." ]
         return (emptyRnGroup, [], Nothing, Nothing)
@@ -165,11 +188,11 @@ createInterface tm flags modMap instIfaceMap = do
       !prunedExportItems = seqList prunedExportItems' `seq` prunedExportItems'
 
   let !aliases =
-        mkAliasMap dflags $ tm_renamed_source tm
+        mkAliasMap dflags renamed
 
   modWarn <- liftErrMsg (moduleWarning dflags gre warnings)
 
-  tokenizedSrc <- mkMaybeTokenizedSrc dflags flags tm
+  tokenizedSrc <- mkMaybeTokenizedSrc dflags flags ms renamed
 
   return $! Interface {
     ifaceMod               = mdl
@@ -1170,7 +1193,7 @@ extractRecSel nm t tvs (L _ con : rest) =
                    where mkAppTyArg :: LHsType GhcRn -> LHsTypeArg GhcRn -> HsType GhcRn
                          mkAppTyArg f (HsValArg ty) = HsAppTy noExt f ty
                          mkAppTyArg f (HsTypeArg ki) = HsAppKindTy noExt f ki
-                         mkAppTyArg f (HsArgPar _) = HsParTy noExt f 
+                         mkAppTyArg f (HsArgPar _) = HsParTy noExt f
 
 -- | Keep export items with docs.
 pruneExportItems :: [ExportItem GhcRn] -> [ExportItem GhcRn]
@@ -1200,23 +1223,21 @@ seqList :: [a] -> ()
 seqList [] = ()
 seqList (x : xs) = x `seq` seqList xs
 
-mkMaybeTokenizedSrc :: DynFlags -> [Flag] -> TypecheckedModule
+mkMaybeTokenizedSrc :: DynFlags -> [Flag] -> ModSummary -> Maybe RenamedSource
                     -> ErrMsgGhc (Maybe [RichToken])
-mkMaybeTokenizedSrc dflags flags tm
-    | Flag_HyperlinkedSource `elem` flags = case renamedSource tm of
+mkMaybeTokenizedSrc dflags flags ms renamed
+    | Flag_HyperlinkedSource `elem` flags = case renamed of
         Just src -> do
-            tokens <- liftGhcToErrMsgGhc (liftIO (mkTokenizedSrc dflags summary src))
+            tokens <- liftIO (mkTokenizedSrc dflags ms src)
             return $ Just tokens
         Nothing -> do
             liftErrMsg . tell . pure $ concat
                 [ "Warning: Cannot hyperlink module \""
-                , moduleNameString . ms_mod_name $ summary
+                , moduleNameString . ms_mod_name $ ms
                 , "\" because renamed source is not available"
                 ]
             return Nothing
     | otherwise = return Nothing
-  where
-    summary = pm_mod_summary . tm_parsed_module $ tm
 
 mkTokenizedSrc :: DynFlags -> ModSummary -> RenamedSource -> IO [RichToken]
 mkTokenizedSrc dflags ms src = do

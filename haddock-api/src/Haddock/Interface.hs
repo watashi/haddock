@@ -43,9 +43,12 @@ import Haddock.Types
 import Haddock.Utils
 
 import Control.Monad
+import Data.IORef
 import Data.List
 import qualified Data.Map as Map
+import Data.Maybe
 import qualified Data.Set as Set
+import Data.Tuple
 import Distribution.Verbosity
 import System.Directory
 import System.FilePath
@@ -56,9 +59,14 @@ import Digraph
 import DynFlags hiding (verbosity)
 import Exception
 import GHC hiding (verbosity)
+import GhcMonad
+import HscMain
 import HscTypes
 import FastString (unpackFS)
-import TcRnTypes (tcg_rdr_env)
+import Plugins
+import TcRnDriver (getRenamedStuff)
+import TcRnMonad
+import TcRnTypes
 import Name (nameIsFromExternalPackage, nameOccName)
 import OccName (isTcOcc)
 import RdrName (unQualOK, gre_name, globalRdrEnvElts)
@@ -129,8 +137,9 @@ createIfaces0 verbosity modules flags instIfaceMap =
   -- compute output file names that are stored in the DynFlags of the
   -- resulting ModSummaries.
   (if useTempDir then withTempOutputDir else id) $ do
-    modGraph <- depAnalysis
-    createIfaces verbosity flags instIfaceMap modGraph
+    targets <- mapM (\f -> guessTarget f Nothing) modules
+    setTargets targets
+    createIfaces verbosity flags instIfaceMap
 
   where
     useTempDir :: Bool
@@ -146,70 +155,135 @@ createIfaces0 verbosity modules flags instIfaceMap =
       withTempDir dir action
 
 
-    depAnalysis :: Ghc ModuleGraph
-    depAnalysis = do
-      targets <- mapM (\f -> guessTarget f Nothing) modules
-      setTargets targets
-      depanal [] False
+type ParsedSourceMap = Map.Map Module ParsedSource
 
 
-createIfaces :: Verbosity -> [Flag] -> InstIfaceMap -> ModuleGraph -> Ghc ([Interface], ModuleSet)
-createIfaces verbosity flags instIfaceMap mods = do
-  let sortedMods = flattenSCCs $ topSortModuleGraph False mods Nothing
+createIfaces :: Verbosity -> [Flag] -> InstIfaceMap -> Ghc ([Interface], ModuleSet)
+createIfaces verbosity flags instIfaceMap = do
   out verbosity normal "Haddock coverage:"
-  (ifaces, _, !ms) <- foldM f ([], Map.empty, emptyModuleSet) sortedMods
-  return (reverse ifaces, ms)
+  parsedMapRef <- liftIO $ newIORef Map.empty
+  ifaceMapRef <- liftIO $ newIORef Map.empty
+  moduleSetRef <- liftIO $ newIORef emptyModuleSet
+  loadOk <- {-# SCC load #-}
+    withTiming getDynFlags "load" (const ()) $
+      gbracket
+        (modifyStaticPlugins
+          (haddockPlugin parsedMapRef ifaceMapRef moduleSetRef:))
+        (\oldPlugins -> modifyStaticPlugins $ \_ -> oldPlugins) $ \_ ->
+        GHC.load LoadAllTargets
+  case loadOk of
+    Failed -> throwE "Cannot typecheck modules"
+    Succeeded -> do
+      modGraph <- GHC.getModuleGraph
+      ifaceMap <- liftIO $ readIORef ifaceMapRef
+      moduleSet <- liftIO $ readIORef moduleSetRef
+      let ifaces =
+            [ Map.findWithDefault (error "haddock:iface") (ms_mod ms) ifaceMap
+            | ms <- flattenSCCs $ topSortModuleGraph True modGraph Nothing
+            ]
+      return (ifaces, moduleSet)
   where
-    f (ifaces, ifaceMap, !ms) modSummary = do
-      x <- {-# SCC processModule #-}
-           withTiming getDynFlags "processModule" (const ()) $ do
-             processModule verbosity modSummary flags ifaceMap instIfaceMap
-      return $ case x of
-        Just (iface, ms') -> ( iface:ifaces
-                             , Map.insert (ifaceMod iface) iface ifaceMap
-                             , unionModuleSet ms ms' )
-        Nothing           -> ( ifaces
-                             , ifaceMap
-                             , ms ) -- Boot modules don't generate ifaces.
+    modifyStaticPlugins
+      :: ([StaticPlugin] -> [StaticPlugin]) -> Ghc [StaticPlugin]
+    modifyStaticPlugins f = do
+      dflags <- getSessionDynFlags
+      let oldPlugins = staticPlugins dflags
+      _ <- setSessionDynFlags $! dflags{ staticPlugins = f oldPlugins }
+      return oldPlugins
 
 
-processModule :: Verbosity -> ModSummary -> [Flag] -> IfaceMap -> InstIfaceMap -> Ghc (Maybe (Interface, ModuleSet))
-processModule verbosity modsum flags modMap instIfaceMap = do
-  out verbosity verbose $ "Checking module " ++ moduleString (ms_mod modsum) ++ "..."
-  tm <- {-# SCC "parse/typecheck/load" #-} loadModule =<< typecheckModule =<< parseModule modsum
+    haddockPlugin
+      :: IORef ParsedSourceMap -> IORef IfaceMap -> IORef ModuleSet
+      -> StaticPlugin
+    haddockPlugin parsedMapRef ifaceMapRef moduleSetRef =
+      StaticPlugin PluginWithArgs
+        { paPlugin = defaultPlugin
+          { parsedResultAction = \_ ->
+              processParsedResult parsedMapRef
+          , renamedResultAction = keepRenamedSource
+          , typeCheckResultAction = \_ ->
+              processTypeCheckResult parsedMapRef ifaceMapRef moduleSetRef
+          }
+        , paArguments = []
+        }
 
-  if not $ isBootSummary modsum then do
-    out verbosity verbose "Creating interface..."
-    (interface, msgs) <- {-# SCC createIterface #-}
-                        withTiming getDynFlags "createInterface" (const ()) $ do
-                          runWriterGhc $ createInterface tm flags modMap instIfaceMap
 
-    -- We need to keep track of which modules were somehow in scope so that when
-    -- Haddock later looks for instances, it also looks in these modules too.
-    --
-    -- See https://github.com/haskell/haddock/issues/469.
-    hsc_env <- getSession
-    let new_rdr_env = tcg_rdr_env . fst . GHC.tm_internals_ $ tm
-        this_pkg = thisPackage (hsc_dflags hsc_env)
-        !mods = mkModuleSet [ nameModule name
-                            | gre <- globalRdrEnvElts new_rdr_env
-                            , let name = gre_name gre
-                            , nameIsFromExternalPackage this_pkg name
-                            , isTcOcc (nameOccName name)   -- Types and classes only
-                            , unQualOK gre ]               -- In scope unqualified
+    processParsedResult
+      :: IORef ParsedSourceMap
+      -> ModSummary -> HsParsedModule -> Hsc HsParsedModule
+    processParsedResult parsedMapRef ms hpm = do
+      when (not $ isBootSummary ms) $
+        liftIO $ atomicModifyIORef' parsedMapRef $ \m ->
+          (Map.insert (ms_mod ms) (hpm_module hpm) m, ())
+      return hpm
 
-    liftIO $ mapM_ putStrLn (nub msgs)
-    dflags <- getDynFlags
-    let (haddockable, haddocked) = ifaceHaddockCoverage interface
-        percentage = round (fromIntegral haddocked * 100 / fromIntegral haddockable :: Double) :: Int
-        modString = moduleString (ifaceMod interface)
-        coverageMsg = printf " %3d%% (%3d /%3d) in '%s'" percentage haddocked haddockable modString
-        header = case ifaceDoc interface of
-          Documentation Nothing _ -> False
-          _ -> True
-        undocumentedExports = [ formatName s n | ExportDecl { expItemDecl = L s n
-                                                            , expItemMbDoc = (Documentation Nothing _, _)
-                                                            } <- ifaceExportItems interface ]
+
+    processTypeCheckResult
+      :: IORef ParsedSourceMap -> IORef IfaceMap -> IORef ModuleSet
+      -> ModSummary -> TcGblEnv -> TcM TcGblEnv
+    processTypeCheckResult parsedMapRef ifaceMapRef moduleSetRef ms tcg = do
+      topEnv <- getTopEnv
+
+      when (not $ isBootSummary ms) $ liftIO $ do
+        maybeParsed <- atomicModifyIORef' parsedMapRef $ \m ->
+          swap $ Map.updateLookupWithKey (\_ _ -> Nothing) (ms_mod ms) m
+        let parsed = fromMaybe (error $ "haddock:maybeParsedResult") maybeParsed
+        ifaceMap <- readIORef ifaceMapRef
+        session <- Session <$> newIORef topEnv
+        (iface, moduleSet) <- {-# SCC processModule #-}
+          flip reflectGhc session $
+            withTiming getDynFlags "processModule" (const ()) $
+              processModule verbosity flags ifaceMap instIfaceMap ms parsed tcg
+        atomicModifyIORef' ifaceMapRef $ \m ->
+          (Map.insert (ms_mod ms) iface m, ())
+        atomicModifyIORef' moduleSetRef $ \m ->
+          (m `unionModuleSet` moduleSet, ())
+      return tcg
+
+
+processModule
+  :: Verbosity -> [Flag] -> IfaceMap -> InstIfaceMap
+  -> ModSummary -> ParsedSource -> TcGblEnv -> Ghc (Interface, ModuleSet)
+processModule verbosity flags ifaceMap instIfaceMap ms parsed tcg = do
+  out verbosity verbose "Creating interface..."
+
+  hsc_env <- getSession
+  let renamed = getRenamedStuff tcg
+      hsc_env_tmp = hsc_env{ hsc_dflags = ms_hspp_opts ms }
+  details <- liftIO $ makeSimpleDetails hsc_env_tmp tcg
+  safety <- liftIO $ finalSafeMode (ms_hspp_opts ms) tcg
+
+  (interface, msgs) <- {-# SCC createIterface #-}
+    withTiming getDynFlags "createInterface" (const ()) $
+      runWriterGhc $
+        createInterfaceInternal flags ifaceMap instIfaceMap
+          ms parsed renamed tcg details safety
+
+  -- We need to keep track of which modules were somehow in scope so that when
+  -- Haddock later looks for instances, it also looks in these modules too.
+  --
+  -- See https://github.com/haskell/haddock/issues/469.
+  let new_rdr_env = tcg_rdr_env tcg
+      this_pkg = thisPackage (hsc_dflags hsc_env)
+      !mods = mkModuleSet [ nameModule name
+                          | gre <- globalRdrEnvElts new_rdr_env
+                          , let name = gre_name gre
+                          , nameIsFromExternalPackage this_pkg name
+                          , isTcOcc (nameOccName name)   -- Types and classes only
+                          , unQualOK gre ]               -- In scope unqualified
+
+  liftIO $ mapM_ putStrLn (nub msgs)
+  dflags <- getDynFlags
+  let (haddockable, haddocked) = ifaceHaddockCoverage interface
+      percentage = round (fromIntegral haddocked * 100 / fromIntegral haddockable :: Double) :: Int
+      modString = moduleString (ifaceMod interface)
+      coverageMsg = printf " %3d%% (%3d /%3d) in '%s'" percentage haddocked haddockable modString
+      header = case ifaceDoc interface of
+        Documentation Nothing _ -> False
+        _ -> True
+      undocumentedExports = [ formatName s n | ExportDecl { expItemDecl = L s n
+                                                          , expItemMbDoc = (Documentation Nothing _, _)
+                                                          } <- ifaceExportItems interface ]
           where
             formatName :: SrcSpan -> HsDecl GhcRn -> String
             formatName loc n = p (getMainDeclBinder n) ++ case loc of
@@ -218,22 +292,20 @@ processModule verbosity modsum flags modMap instIfaceMap = do
 
             p [] = ""
             p (x:_) = let n = pretty dflags x
-                          ms = modString ++ "."
-                      in if ms `isPrefixOf` n
-                         then drop (length ms) n
+                          mstr = modString ++ "."
+                      in if mstr `isPrefixOf` n
+                         then drop (length mstr) n
                          else n
 
-    when (OptHide `notElem` ifaceOptions interface) $ do
-      out verbosity normal coverageMsg
-      when (Flag_NoPrintMissingDocs `notElem` flags
-            && not (null undocumentedExports && header)) $ do
-        out verbosity normal "  Missing documentation for:"
-        unless header $ out verbosity normal "    Module header"
-        mapM_ (out verbosity normal . ("    " ++)) undocumentedExports
-    interface' <- liftIO $ evaluate interface
-    return (Just (interface', mods))
-  else
-    return Nothing
+  when (OptHide `notElem` ifaceOptions interface) $ do
+    out verbosity normal coverageMsg
+    when (Flag_NoPrintMissingDocs `notElem` flags
+          && not (null undocumentedExports && header)) $ do
+      out verbosity normal "  Missing documentation for:"
+      unless header $ out verbosity normal "    Module header"
+      mapM_ (out verbosity normal . ("    " ++)) undocumentedExports
+  interface' <- liftIO $ evaluate interface
+  return (interface', mods)
 
 
 --------------------------------------------------------------------------------
